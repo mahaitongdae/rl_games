@@ -376,6 +376,8 @@ class ExperienceBuffer:
             for k,v in val.items():
                 self.tensor_dict[name][k][index,:] = v
         else:
+            if name not in self.tensor_dict:
+                self.tensor_dict[name] = torch.zeros_like(val.unsqueeze(0)).repeat((self.horizon_length, 1, 1))
             self.tensor_dict[name][index,:] = val
 
 

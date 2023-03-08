@@ -714,6 +714,8 @@ class A2CBase(BaseAlgorithm):
                 shaped_rewards += self.gamma * res_dict['values'] * self.cast_obs(infos['time_outs']).unsqueeze(1).float()
 
             self.experience_buffer.update_data('rewards', n, shaped_rewards)
+            if "ground_truths" in infos:
+                self.experience_buffer.update_data('ground_truths', n, infos["ground_truths"])
 
             self.current_rewards += rewards
             self.current_lengths += 1
@@ -753,6 +755,9 @@ class A2CBase(BaseAlgorithm):
             states.append(mb_s.permute(1,2,0,3).reshape(-1,t_size, h_size))
         batch_dict['rnn_states'] = states
         batch_dict['step_time'] = step_time
+        if "ground_truths" in infos:
+            mb_ground_truths = self.experience_buffer.tensor_dict["ground_truths"]
+            batch_dict["ground_truths"] = swap_and_flatten01(mb_ground_truths)
         return batch_dict
 
 
@@ -1049,15 +1054,24 @@ class ContinuousA2CBase(A2CBase):
         a_losses = []
         c_losses = []
         b_losses = []
+        s_losses = []
         entropies = []
         kls = []
 
         for mini_ep in range(0, self.mini_epochs_num):
             ep_kls = []
             for i in range(len(self.dataset)):
-                a_loss, c_loss, entropy, kl, last_lr, lr_mul, cmu, csigma, b_loss = self.train_actor_critic(self.dataset[i])
+                train_results = self.train_actor_critic(self.dataset[i])
+                if len(train_results) == 9:
+                    has_s_loss = False
+                    a_loss, c_loss, entropy, kl, last_lr, lr_mul, cmu, csigma, b_loss = train_results
+                else:
+                    has_s_loss = True
+                    a_loss, c_loss, entropy, kl, last_lr, lr_mul, cmu, csigma, b_loss, s_loss = train_results
                 a_losses.append(a_loss)
                 c_losses.append(c_loss)
+                if has_s_loss:
+                    s_losses.append(s_loss)
                 ep_kls.append(kl)
                 entropies.append(entropy)
                 if self.bounds_loss_coef is not None:
@@ -1090,7 +1104,7 @@ class ContinuousA2CBase(A2CBase):
         update_time = update_time_end - update_time_start
         total_time = update_time_end - play_time_start
 
-        return batch_dict['step_time'], play_time, update_time, total_time, a_losses, c_losses, b_losses, entropies, kls, last_lr, lr_mul
+        return batch_dict['step_time'], play_time, update_time, total_time, a_losses, c_losses, b_losses, s_losses, entropies, kls, last_lr, lr_mul
 
     def prepare_dataset(self, batch_dict):
         obses = batch_dict['obses']
@@ -1103,6 +1117,7 @@ class ContinuousA2CBase(A2CBase):
         sigmas = batch_dict['sigmas']
         rnn_states = batch_dict.get('rnn_states', None)
         rnn_masks = batch_dict.get('rnn_masks', None)
+        ground_truths = batch_dict.get('ground_truths', None)
 
         advantages = returns - values
 
@@ -1138,6 +1153,8 @@ class ContinuousA2CBase(A2CBase):
         dataset_dict['rnn_masks'] = rnn_masks
         dataset_dict['mu'] = mus
         dataset_dict['sigma'] = sigmas
+        if ground_truths is not None:
+            dataset_dict['ground_truths'] = ground_truths
 
         self.dataset.update_values_dict(dataset_dict)
 
@@ -1169,7 +1186,7 @@ class ContinuousA2CBase(A2CBase):
 
         while True:
             epoch_num = self.update_epoch()
-            step_time, play_time, update_time, sum_time, a_losses, c_losses, b_losses, entropies, kls, last_lr, lr_mul = self.train_epoch()
+            step_time, play_time, update_time, sum_time, a_losses, c_losses, b_losses, s_losses, entropies, kls, last_lr, lr_mul = self.train_epoch()
             total_time += sum_time
             frame = self.frame // self.num_agents
 
@@ -1195,6 +1212,8 @@ class ContinuousA2CBase(A2CBase):
                 self.write_stats(total_time, epoch_num, step_time, play_time, update_time, a_losses, c_losses, entropies, kls, last_lr, lr_mul, frame, scaled_time, scaled_play_time, curr_frames)
                 if len(b_losses) > 0:
                     self.writer.add_scalar('losses/bounds_loss', torch_ext.mean_list(b_losses).item(), frame)
+                if len(s_losses) > 0:
+                    self.writer.add_scalar('losses/supervised_loss', torch_ext.mean_list(s_losses).item(), frame)
 
                 if self.has_soft_aug:
                     self.writer.add_scalar('losses/aug_loss', np.mean(aug_losses), frame)
@@ -1220,7 +1239,7 @@ class ContinuousA2CBase(A2CBase):
                     checkpoint_name = self.config['name'] + '_ep_' + str(epoch_num) + '_rew_' + str(mean_rewards[0])
 
                     if self.save_freq > 0:
-                        if (epoch_num % self.save_freq == 0) and (mean_rewards[0] <= self.last_mean_rewards):
+                        if epoch_num % self.save_freq == 0:
                             self.save(os.path.join(self.nn_dir, 'last_' + checkpoint_name))
 
                     if mean_rewards[0] > self.last_mean_rewards and epoch_num >= self.save_best_after:

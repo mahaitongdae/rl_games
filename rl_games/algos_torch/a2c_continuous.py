@@ -85,6 +85,7 @@ class A2CAgent(a2c_common.ContinuousA2CBase):
         actions_batch = input_dict['actions']
         obs_batch = input_dict['obs']
         obs_batch = self._preproc_obs(obs_batch)
+        gt_batch = input_dict.get("ground_truths", None)
 
         lr_mul = 1.0
         curr_e_clip = self.e_clip
@@ -109,6 +110,7 @@ class A2CAgent(a2c_common.ContinuousA2CBase):
             entropy = res_dict['entropy']
             mu = res_dict['mus']
             sigma = res_dict['sigmas']
+            prediction = res_dict.get("prediction", None)
 
             a_loss = self.actor_loss_func(old_action_log_probs_batch, action_log_probs, advantage, self.ppo, curr_e_clip)
 
@@ -122,10 +124,21 @@ class A2CAgent(a2c_common.ContinuousA2CBase):
                 b_loss = self.bound_loss(mu)
             else:
                 b_loss = torch.zeros(1, device=self.ppo_device)
-            losses, sum_mask = torch_ext.apply_masks([a_loss.unsqueeze(1), c_loss , entropy.unsqueeze(1), b_loss.unsqueeze(1)], rnn_masks)
+            if prediction is not None:
+                s_loss = (prediction - gt_batch) ** 2
+
+            loss_terms = [a_loss.unsqueeze(1), c_loss , entropy.unsqueeze(1), b_loss.unsqueeze(1)]
+            if prediction is not None:
+                loss_terms += [s_loss]
+            losses, sum_mask = torch_ext.apply_masks(loss_terms, rnn_masks)
             a_loss, c_loss, entropy, b_loss = losses[0], losses[1], losses[2], losses[3]
+            if prediction is not None:
+                s_loss = losses[4]
 
             loss = a_loss + 0.5 * c_loss * self.critic_coef - entropy * self.entropy_coef + b_loss * self.bounds_loss_coef
+
+            if prediction is not None:
+                loss += s_loss
             
             if self.multi_gpu:
                 self.optimizer.zero_grad()
@@ -155,6 +168,8 @@ class A2CAgent(a2c_common.ContinuousA2CBase):
         self.train_result = (a_loss, c_loss, entropy, \
             kl_dist, self.last_lr, lr_mul, \
             mu.detach(), sigma.detach(), b_loss)
+        if prediction is not None:
+            self.train_result += (s_loss,)
 
     def train_actor_critic(self, input_dict):
         self.calc_gradients(input_dict)

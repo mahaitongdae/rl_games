@@ -258,6 +258,8 @@ class ModelA2CContinuousLogStd(BaseModel):
                     'mus' : mu,
                     'sigmas' : sigma
                 }                
+                if hasattr(self.a2c_network, "prediction"):
+                    result["prediction"] = self.a2c_network.prediction
                 return result
             else:
                 selected_action = distr.sample()
