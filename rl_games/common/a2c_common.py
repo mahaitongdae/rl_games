@@ -654,7 +654,7 @@ class A2CBase(BaseAlgorithm):
             self.game_lengths.update(self.current_lengths[env_done_indices])
             self.algo_observer.process_infos(infos, env_done_indices)
 
-            not_dones = 1.0 - self.dones.float()
+            not_dones = 1.0 - self.dones.bool().float()
 
             self.current_rewards = self.current_rewards * not_dones.unsqueeze(1)
             self.current_lengths = self.current_lengths * not_dones
