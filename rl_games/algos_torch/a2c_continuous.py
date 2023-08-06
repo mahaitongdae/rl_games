@@ -111,6 +111,7 @@ class A2CAgent(a2c_common.ContinuousA2CBase):
             mu = res_dict['mus']
             sigma = res_dict['sigmas']
             prediction = res_dict.get("prediction", None)
+            autonomous_losses = res_dict.get("autonomous_losses", None)
 
             a_loss = self.actor_loss_func(old_action_log_probs_batch, action_log_probs, advantage, self.ppo, curr_e_clip)
 
@@ -130,15 +131,25 @@ class A2CAgent(a2c_common.ContinuousA2CBase):
             loss_terms = [a_loss.unsqueeze(1), c_loss , entropy.unsqueeze(1), b_loss.unsqueeze(1)]
             if prediction is not None:
                 loss_terms += [s_loss]
+            if autonomous_losses is not None:
+                if prediction is None:
+                    loss_terms += [torch.tensor(0.)]  # placeholder for supervised loss
+                loss_terms += list(autonomous_losses.values())
             losses, sum_mask = torch_ext.apply_masks(loss_terms, rnn_masks)
             a_loss, c_loss, entropy, b_loss = losses[0], losses[1], losses[2], losses[3]
             if prediction is not None:
                 s_loss = losses[4]
+            if autonomous_losses is not None:
+                for (i, k) in enumerate(autonomous_losses):
+                    autonomous_losses[k] = losses[5 + i]
 
             loss = a_loss + 0.5 * c_loss * self.critic_coef - entropy * self.entropy_coef + b_loss * self.bounds_loss_coef
 
             if prediction is not None:
                 loss += s_loss
+            if autonomous_losses is not None:
+                for l in autonomous_losses.values():
+                    loss += l
             
             if self.multi_gpu:
                 self.optimizer.zero_grad()
@@ -170,6 +181,10 @@ class A2CAgent(a2c_common.ContinuousA2CBase):
             mu.detach(), sigma.detach(), b_loss)
         if prediction is not None:
             self.train_result += (s_loss,)
+        if autonomous_losses is not None:
+            if prediction is None:
+                self.train_result += (torch.tensor(0.),)  # placeholder for supervised loss
+            self.train_result += (autonomous_losses,)
 
     def train_actor_critic(self, input_dict):
         self.calc_gradients(input_dict)
@@ -191,5 +206,3 @@ class A2CAgent(a2c_common.ContinuousA2CBase):
         else:
             b_loss = 0
         return b_loss
-
-

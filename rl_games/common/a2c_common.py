@@ -1055,6 +1055,7 @@ class ContinuousA2CBase(A2CBase):
         c_losses = []
         b_losses = []
         s_losses = []
+        auto_losses = []
         entropies = []
         kls = []
 
@@ -1064,14 +1065,24 @@ class ContinuousA2CBase(A2CBase):
                 train_results = self.train_actor_critic(self.dataset[i])
                 if len(train_results) == 9:
                     has_s_loss = False
+                    has_auto_loss = False
                     a_loss, c_loss, entropy, kl, last_lr, lr_mul, cmu, csigma, b_loss = train_results
-                else:
+                elif len(train_results) == 10:
                     has_s_loss = True
+                    has_auto_loss = False
                     a_loss, c_loss, entropy, kl, last_lr, lr_mul, cmu, csigma, b_loss, s_loss = train_results
+                elif len(train_results) == 11:
+                    has_s_loss = True
+                    has_auto_loss = True
+                    a_loss, c_loss, entropy, kl, last_lr, lr_mul, cmu, csigma, b_loss, s_loss, auto_loss = train_results
+                else:
+                    raise NotImplementedError
                 a_losses.append(a_loss)
                 c_losses.append(c_loss)
                 if has_s_loss:
                     s_losses.append(s_loss)
+                if has_auto_loss:
+                    auto_losses.append(auto_loss)
                 ep_kls.append(kl)
                 entropies.append(entropy)
                 if self.bounds_loss_coef is not None:
@@ -1104,7 +1115,7 @@ class ContinuousA2CBase(A2CBase):
         update_time = update_time_end - update_time_start
         total_time = update_time_end - play_time_start
 
-        return batch_dict['step_time'], play_time, update_time, total_time, a_losses, c_losses, b_losses, s_losses, entropies, kls, last_lr, lr_mul
+        return batch_dict['step_time'], play_time, update_time, total_time, a_losses, c_losses, b_losses, s_losses, auto_losses, entropies, kls, last_lr, lr_mul
 
     def prepare_dataset(self, batch_dict):
         obses = batch_dict['obses']
@@ -1186,7 +1197,7 @@ class ContinuousA2CBase(A2CBase):
 
         while True:
             epoch_num = self.update_epoch()
-            step_time, play_time, update_time, sum_time, a_losses, c_losses, b_losses, s_losses, entropies, kls, last_lr, lr_mul = self.train_epoch()
+            step_time, play_time, update_time, sum_time, a_losses, c_losses, b_losses, s_losses, auto_losses, entropies, kls, last_lr, lr_mul = self.train_epoch()
             total_time += sum_time
             frame = self.frame // self.num_agents
 
@@ -1214,6 +1225,9 @@ class ContinuousA2CBase(A2CBase):
                     self.writer.add_scalar('losses/bounds_loss', torch_ext.mean_list(b_losses).item(), frame)
                 if len(s_losses) > 0:
                     self.writer.add_scalar('losses/supervised_loss', torch_ext.mean_list(s_losses).item(), frame)
+                if len(auto_losses) > 0:
+                    for k in auto_losses[0].keys():
+                        self.writer.add_scalar(f'losses/{k}', torch_ext.mean_list([d[k] for d in auto_losses]).item(), frame)
 
                 if self.has_soft_aug:
                     self.writer.add_scalar('losses/aug_loss', np.mean(aug_losses), frame)
