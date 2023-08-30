@@ -48,6 +48,7 @@ class BasePlayer(object):
             self.is_deterministic = self.player_config.get('determenistic', True)
         self.n_game_life = self.player_config.get('n_game_life', 1)
         self.print_stats = self.player_config.get('print_stats', True)
+        self.dump_stats = self.player_config.get('dump_stats', False)
         self.render_sleep = self.player_config.get('render_sleep', 0.002)
         self.max_steps = 108000 // 4
         self.device = torch.device(self.device_name)
@@ -258,6 +259,8 @@ class BasePlayer(object):
                         break
 
         print(sum_rewards)
+        if self.dump_stats:
+            self.env.dump_stats()
         if print_game_res:
             print('av reward:', sum_rewards / games_played * n_game_life, 'av steps:', sum_steps /
                   games_played * n_game_life, 'winrate:', sum_game_res / games_played * n_game_life)
