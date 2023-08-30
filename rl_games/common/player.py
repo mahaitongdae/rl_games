@@ -42,6 +42,10 @@ class BasePlayer(object):
         self.device_name = self.config.get('device_name', 'cuda')
         self.render_env = self.player_config.get('render', False)
         self.games_num = self.player_config.get('games_num', 2000)
+
+        # Limit maximum number of games per worker to take into statistics, to avoid bias toward short episodes
+        self.max_games_per_worker = self.player_config.get('max_games_per_worker', 1)
+        assert self.max_games_per_worker * self.env.get_num_parallel() >= self.games_num
         if 'deterministic' in self.player_config:
             self.is_deterministic = self.player_config['deterministic']
         else:
@@ -186,6 +190,7 @@ class BasePlayer(object):
             has_masks = self.env.has_action_mask()
 
         need_init_rnn = self.is_rnn
+        worker_done_count = None
         for _ in range(n_games):
             if games_played >= n_games:
                 break
@@ -221,7 +226,11 @@ class BasePlayer(object):
 
                 all_done_indices = done.nonzero(as_tuple=False)
                 done_indices = all_done_indices[::self.num_agents]
-                done_count = len(done_indices)
+                if worker_done_count is None:
+                    worker_done_count = torch.zeros_like(done).to(dtype=torch.long)
+                worker_done_count[done_indices] += 1
+                effective_done_indices = (done & (worker_done_count <= self.max_games_per_worker)).nonzero(as_tuple=False)[::self.num_agents]
+                done_count = len(effective_done_indices)
                 games_played += done_count
 
                 if done_count > 0:
@@ -229,8 +238,8 @@ class BasePlayer(object):
                         for s in self.states:
                             s[:, all_done_indices, :] = s[:,all_done_indices, :] * 0.0
 
-                    cur_rewards = cr[done_indices].sum().item()
-                    cur_steps = steps[done_indices].sum().item()
+                    cur_rewards = cr[effective_done_indices].sum().item()
+                    cur_steps = steps[effective_done_indices].sum().item()
 
                     cr = cr * (1.0 - done.float())
                     steps = steps * (1.0 - done.float())
