@@ -337,6 +337,17 @@ class AverageMeter(nn.Module):
         self.current_size = size_sum
         self.mean = (self.mean * old_size + new_mean * size) / size_sum
 
+    def weighted_update(self, values, repeat):
+        total_size = repeat.sum().item()
+        if total_size == 0:
+            return
+        new_mean = torch.sum(values.float() * repeat, dim=0) / total_size
+        total_size = np.clip(total_size, 0, self.max_size)
+        old_size = min(self.max_size - total_size, self.current_size)
+        size_sum = old_size + total_size
+        self.current_size = size_sum
+        self.mean = (self.mean * old_size + new_mean * total_size) / size_sum
+
     def clear(self):
         self.current_size = 0
         self.mean.fill_(0)

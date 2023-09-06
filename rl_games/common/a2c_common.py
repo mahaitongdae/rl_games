@@ -178,10 +178,12 @@ class A2CBase(BaseAlgorithm):
         self.tau = self.config['tau']
 
         self.games_to_track = self.config.get('games_to_track', 100)
+        self.steps_to_track_per_game = self.config.get('steps_to_track_per_game', 1000)
         print('current training device:', self.ppo_device)
         self.game_rewards = torch_ext.AverageMeter(self.value_size, self.games_to_track).to(self.ppo_device)
         self.game_lengths = torch_ext.AverageMeter(1, self.games_to_track).to(self.ppo_device)
         self.obs = None
+        self.step_rewards = torch_ext.AverageMeter(1, self.games_to_track * self.steps_to_track_per_game).to(self.ppo_device)
         self.games_num = self.config['minibatch_size'] // self.seq_len # it is used only for current rnn implementation
         self.batch_size = self.horizon_length * self.num_actors * self.num_agents
         self.batch_size_envs = self.horizon_length * self.num_actors
@@ -199,6 +201,7 @@ class A2CBase(BaseAlgorithm):
         self.frame = 0
         self.update_time = 0
         self.mean_rewards = self.last_mean_rewards = -100500
+        self.mean_step_rewards = self.last_mean_step_rewards = -100500
         self.play_time = 0
         self.epoch_num = 0
         self.curr_frames = 0
@@ -509,7 +512,9 @@ class A2CBase(BaseAlgorithm):
         batch_size = self.num_agents * self.num_actors
         self.game_rewards.clear()
         self.game_lengths.clear()
+        self.step_rewards.clear()
         self.mean_rewards = self.last_mean_rewards = -100500
+        self.mean_step_rewards = self.last_mean_step_rewards = -100500
         self.algo_observer.after_clear_stats()
 
     def update_epoch(self):
@@ -547,6 +552,7 @@ class A2CBase(BaseAlgorithm):
         # This is actually the best reward ever achieved. last_mean_rewards is perhaps not the best variable name
         # We save it to the checkpoint to prevent overriding the "best ever" checkpoint upon experiment restart
         state['last_mean_rewards'] = self.last_mean_rewards
+        state['last_mean_step_rewards'] = self.last_mean_step_rewards
 
         if self.vec_env is not None:
             env_state = self.vec_env.get_env_state()
@@ -562,6 +568,7 @@ class A2CBase(BaseAlgorithm):
         self.optimizer.load_state_dict(weights['optimizer'])
         self.frame = weights.get('frame', 0)
         self.last_mean_rewards = weights.get('last_mean_rewards', -100500)
+        self.last_mean_step_rewards = weights.get('last_mean_step_rewards', -100500)
 
         env_state = weights.get('env_state', None)
 
@@ -651,6 +658,7 @@ class A2CBase(BaseAlgorithm):
             env_done_indices = self.dones.view(self.num_actors, self.num_agents).all(dim=1).nonzero(as_tuple=False)
 
             self.game_rewards.update(self.current_rewards[env_done_indices])
+            self.step_rewards.weighted_update(self.current_rewards[env_done_indices] / self.current_lengths[env_done_indices].unsqueeze(-1), self.current_lengths[env_done_indices].unsqueeze(-1))
             self.game_lengths.update(self.current_lengths[env_done_indices])
             self.algo_observer.process_infos(infos, env_done_indices)
 
@@ -728,6 +736,7 @@ class A2CBase(BaseAlgorithm):
                     self.central_value_net.post_step_rnn(all_done_indices)
 
             self.game_rewards.update(self.current_rewards[env_done_indices])
+            self.step_rewards.weighted_update(self.current_rewards[env_done_indices] / self.current_lengths[env_done_indices].unsqueeze(-1), self.current_lengths[env_done_indices].unsqueeze(-1))
             self.game_lengths.update(self.current_lengths[env_done_indices])
             self.algo_observer.process_infos(infos, env_done_indices)
 
@@ -902,6 +911,7 @@ class DiscreteA2CBase(A2CBase):
     def train(self):
         self.init_tensors()
         self.mean_rewards = self.last_mean_rewards = -100500
+        self.mean_step_rewards = self.last_mean_step_rewards = -100500
         start_time = time.time()
         total_time = 0
         rep_count = 0
@@ -946,14 +956,23 @@ class DiscreteA2CBase(A2CBase):
 
                 if self.game_rewards.current_size > 0:
                     mean_rewards = self.game_rewards.get_mean()
+                    mean_step_rewards = self.step_rewards.get_mean()
                     mean_lengths = self.game_lengths.get_mean()
                     self.mean_rewards = mean_rewards[0]
+                    self.mean_step_rewards = mean_step_rewards[0]
 
                     for i in range(self.value_size):
                         rewards_name = 'rewards' if i == 0 else 'rewards{0}'.format(i)
-                        self.writer.add_scalar(rewards_name + '/step'.format(i), mean_rewards[i], frame)
-                        self.writer.add_scalar(rewards_name + '/iter'.format(i), mean_rewards[i], epoch_num)
-                        self.writer.add_scalar(rewards_name + '/time'.format(i), mean_rewards[i], total_time)
+                        costs_name = 'costs' if i == 0 else 'costs{0}'.format(i)
+                        self.writer.add_scalar('per_game_' + rewards_name + '/step'.format(i), mean_rewards[i], frame)
+                        self.writer.add_scalar('per_game_' + rewards_name + '/iter'.format(i), mean_rewards[i], epoch_num)
+                        self.writer.add_scalar('per_game_' + rewards_name + '/time'.format(i), mean_rewards[i], total_time)
+                        self.writer.add_scalar('per_step_' + rewards_name + '/step'.format(i), mean_step_rewards[i], frame)
+                        self.writer.add_scalar('per_step_' + rewards_name + '/iter'.format(i), mean_step_rewards[i], epoch_num)
+                        self.writer.add_scalar('per_step_' + rewards_name + '/time'.format(i), mean_step_rewards[i], total_time)
+                        self.writer.add_scalar('per_step_' + costs_name + '/step'.format(i), -mean_step_rewards[i], frame)
+                        self.writer.add_scalar('per_step_' + costs_name + '/iter'.format(i), -mean_step_rewards[i], epoch_num)
+                        self.writer.add_scalar('per_step_' + costs_name + '/time'.format(i), -mean_step_rewards[i], total_time)
 
                     self.writer.add_scalar('episode_lengths/step', mean_lengths, frame)
                     self.writer.add_scalar('episode_lengths/iter', mean_lengths, epoch_num)
@@ -966,16 +985,16 @@ class DiscreteA2CBase(A2CBase):
                     checkpoint_name = self.config['name'] + '_ep_' + str(epoch_num) + '_rew_' + str(mean_rewards[0])
 
                     if self.save_freq > 0:
-                        if (epoch_num % self.save_freq == 0) and (mean_rewards <= self.last_mean_rewards):
+                        if (epoch_num % self.save_freq == 0) and (mean_step_rewards <= self.last_mean_step_rewards):
                             self.save(os.path.join(self.nn_dir, 'last_' + checkpoint_name))
 
-                    if mean_rewards[0] > self.last_mean_rewards and epoch_num >= self.save_best_after:
-                        print('saving next best rewards: ', mean_rewards)
-                        self.last_mean_rewards = mean_rewards[0]
+                    if mean_step_rewards[0] > self.last_mean_step_rewards and epoch_num >= self.save_best_after:
+                        print('saving next best rewards: ', mean_step_rewards)
+                        self.last_mean_step_rewards = mean_step_rewards[0]
                         self.save(os.path.join(self.nn_dir, self.config['name']))
 
                         if 'score_to_win' in self.config:
-                            if self.last_mean_rewards > self.config['score_to_win']:
+                            if self.last_mean_step_rewards > self.config['score_to_win']:
                                 print('Network won!')
                                 self.save(os.path.join(self.nn_dir, checkpoint_name))
                                 should_exit = True
@@ -995,7 +1014,7 @@ class DiscreteA2CBase(A2CBase):
                 dist.broadcast(should_exit_t, 0)
                 should_exit = should_exit_t.bool().item()
             if should_exit:
-                return self.last_mean_rewards, epoch_num
+                return self.last_mean_step_rewards, epoch_num
 
 
 class ContinuousA2CBase(A2CBase):
@@ -1183,6 +1202,7 @@ class ContinuousA2CBase(A2CBase):
     def train(self):
         self.init_tensors()
         self.last_mean_rewards = -100500
+        self.last_mean_step_rewards = -100500
         start_time = time.time()
         total_time = 0
         rep_count = 0
@@ -1234,14 +1254,23 @@ class ContinuousA2CBase(A2CBase):
 
                 if self.game_rewards.current_size > 0:
                     mean_rewards = self.game_rewards.get_mean()
+                    mean_step_rewards = self.step_rewards.get_mean()
                     mean_lengths = self.game_lengths.get_mean()
                     self.mean_rewards = mean_rewards[0]
+                    self.mean_step_rewards = mean_step_rewards[0]
 
                     for i in range(self.value_size):
                         rewards_name = 'rewards' if i == 0 else 'rewards{0}'.format(i)
-                        self.writer.add_scalar(rewards_name + '/step'.format(i), mean_rewards[i], frame)
-                        self.writer.add_scalar(rewards_name + '/iter'.format(i), mean_rewards[i], epoch_num)
-                        self.writer.add_scalar(rewards_name + '/time'.format(i), mean_rewards[i], total_time)
+                        costs_name = 'costs' if i == 0 else 'costs{0}'.format(i)
+                        self.writer.add_scalar('per_game_' + rewards_name + '/step'.format(i), mean_rewards[i], frame)
+                        self.writer.add_scalar('per_game_' + rewards_name + '/iter'.format(i), mean_rewards[i], epoch_num)
+                        self.writer.add_scalar('per_game_' + rewards_name + '/time'.format(i), mean_rewards[i], total_time)
+                        self.writer.add_scalar('per_step_' + rewards_name + '/step'.format(i), mean_step_rewards[i], frame)
+                        self.writer.add_scalar('per_step_' + rewards_name + '/iter'.format(i), mean_step_rewards[i], epoch_num)
+                        self.writer.add_scalar('per_step_' + rewards_name + '/time'.format(i), mean_step_rewards[i], total_time)
+                        self.writer.add_scalar('per_step_' + costs_name + '/step'.format(i), -mean_step_rewards[i], frame)
+                        self.writer.add_scalar('per_step_' + costs_name + '/iter'.format(i), -mean_step_rewards[i], epoch_num)
+                        self.writer.add_scalar('per_step_' + costs_name + '/time'.format(i), -mean_step_rewards[i], total_time)
 
                     self.writer.add_scalar('episode_lengths/step', mean_lengths, frame)
                     self.writer.add_scalar('episode_lengths/iter', mean_lengths, epoch_num)
@@ -1256,13 +1285,13 @@ class ContinuousA2CBase(A2CBase):
                         if epoch_num % self.save_freq == 0:
                             self.save(os.path.join(self.nn_dir, 'last_' + checkpoint_name))
 
-                    if mean_rewards[0] > self.last_mean_rewards and epoch_num >= self.save_best_after:
-                        print('saving next best rewards: ', mean_rewards)
-                        self.last_mean_rewards = mean_rewards[0]
+                    if mean_step_rewards[0] > self.last_mean_step_rewards and epoch_num >= self.save_best_after:
+                        print('saving next best rewards: ', mean_step_rewards)
+                        self.last_mean_step_rewards = mean_step_rewards[0]
                         self.save(os.path.join(self.nn_dir, self.config['name']))
 
                         if 'score_to_win' in self.config:
-                            if self.last_mean_rewards > self.config['score_to_win']:
+                            if self.last_mean_step_rewards > self.config['score_to_win']:
                                 print('Network won!')
                                 self.save(os.path.join(self.nn_dir, checkpoint_name))
                                 should_exit = True
@@ -1282,7 +1311,7 @@ class ContinuousA2CBase(A2CBase):
                 dist.broadcast(should_exit_t, 0)
                 should_exit = should_exit_t.float().item()
             if should_exit:
-                return self.last_mean_rewards, epoch_num
+                return self.last_mean_step_rewards, epoch_num
 
             if should_exit:
-                return self.last_mean_rewards, epoch_num
+                return self.last_mean_step_rewards, epoch_num
