@@ -143,7 +143,13 @@ class A2CAgent(a2c_common.ContinuousA2CBase):
                 for (i, k) in enumerate(autonomous_losses):
                     autonomous_losses[k] = losses[5 + i]
 
-            loss = a_loss + 0.5 * c_loss * self.critic_coef - entropy * self.entropy_coef + b_loss * self.bounds_loss_coef
+            # Ignore normal actor loss if it is prescribed in autonomous_losses that only imitation loss should be used
+            if autonomous_losses is not None and 'imitation_only' in autonomous_losses:
+                coef_a_loss = 0.0
+            else:
+                coef_a_loss = 1.0
+
+            loss = coef_a_loss * a_loss + 0.5 * c_loss * self.critic_coef - entropy * self.entropy_coef + b_loss * self.bounds_loss_coef
 
             if prediction is not None:
                 loss += s_loss
