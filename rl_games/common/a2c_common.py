@@ -343,14 +343,15 @@ class A2CBase(BaseAlgorithm):
         #if self.has_central_value:
         #    self.central_value_net.update_lr(lr)
 
-    def get_action_values(self, obs):
+    def get_action_values(self, obs, infos):
         processed_obs = self._preproc_obs(obs['obs'])
         self.model.eval()
         input_dict = {
             'is_train': False,
             'prev_actions': None,
             'obs' : processed_obs,
-            'rnn_states' : self.rnn_states
+            'rnn_states' : self.rnn_states,
+            'info': infos,
         }
 
         with torch.no_grad():
@@ -413,6 +414,7 @@ class A2CBase(BaseAlgorithm):
         self.current_actual_costs = torch.zeros(current_rewards_shape, dtype=torch.float32, device=self.ppo_device)
         self.current_lengths = torch.zeros(batch_size, dtype=torch.float32, device=self.ppo_device)
         self.dones = torch.ones((batch_size,), dtype=torch.uint8, device=self.ppo_device)
+        self.infos = {}
 
         if self.is_rnn:
             self.rnn_states = self.model.get_default_rnn_state()
@@ -641,7 +643,7 @@ class A2CBase(BaseAlgorithm):
                 masks = self.vec_env.get_action_masks()
                 res_dict = self.get_masked_action_values(self.obs, masks)
             else:
-                res_dict = self.get_action_values(self.obs)
+                res_dict = self.get_action_values(self.obs, self.infos)
             self.experience_buffer.update_data('obses', n, self.obs['obs'])
             self.experience_buffer.update_data('dones', n, self.dones)
 
@@ -652,6 +654,7 @@ class A2CBase(BaseAlgorithm):
 
             step_time_start = time.time()
             self.obs, rewards, self.dones, infos = self.env_step(res_dict['actions'])
+            self.infos = infos
             step_time_end = time.time()
 
             step_time += (step_time_end - step_time_start)

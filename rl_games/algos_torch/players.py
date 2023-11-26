@@ -3,7 +3,7 @@ from rl_games.algos_torch import torch_ext
 from rl_games.algos_torch.running_mean_std import RunningMeanStd
 from rl_games.common.tr_helpers import unsqueeze_obs
 import gym
-import torch 
+import torch
 from torch import nn
 import numpy as np
 
@@ -19,7 +19,7 @@ class PpoPlayerContinuous(BasePlayer):
     def __init__(self, params):
         BasePlayer.__init__(self, params)
         self.network = self.config['network']
-        self.actions_num = self.action_space.shape[0] 
+        self.actions_num = self.action_space.shape[0]
         self.actions_low = torch.from_numpy(self.action_space.low.copy()).float().to(self.device)
         self.actions_high = torch.from_numpy(self.action_space.high.copy()).float().to(self.device)
         self.mask = [False]
@@ -35,21 +35,22 @@ class PpoPlayerContinuous(BasePlayer):
             'value_size': self.env_info.get('value_size',1),
             'normalize_value': self.normalize_value,
             'normalize_input': self.normalize_input,
-        } 
+        }
         self.model = self.network.build(config)
         self.model.to(self.device)
         self.model.eval()
         self.is_rnn = self.model.is_rnn()
 
-    def get_action(self, obs, is_deterministic = False):
+    def get_action(self, obs, is_deterministic=False, infos={}):
         if self.has_batch_dimension == False:
             obs = unsqueeze_obs(obs)
         obs = self._preproc_obs(obs)
         input_dict = {
             'is_train': False,
-            'prev_actions': None, 
+            'prev_actions': None,
             'obs' : obs,
-            'rnn_states' : self.states
+            'rnn_states' : self.states,
+            'info': infos,
         }
         with torch.no_grad():
             res_dict = self.model(input_dict)
@@ -117,7 +118,7 @@ class PpoPlayerDiscrete(BasePlayer):
         action_masks = torch.Tensor(action_masks).to(self.device).bool()
         input_dict = {
             'is_train': False,
-            'prev_actions': None, 
+            'prev_actions': None,
             'obs' : obs,
             'action_masks' : action_masks,
             'rnn_states' : self.states
@@ -133,12 +134,12 @@ class PpoPlayerDiscrete(BasePlayer):
             if is_deterministic:
                 action = [torch.argmax(logit.detach(), axis=-1).squeeze() for logit in logits]
                 return torch.stack(action,dim=-1)
-            else:    
+            else:
                 return action.squeeze().detach()
         else:
             if is_deterministic:
                 return torch.argmax(logits.detach(), axis=-1).squeeze()
-            else:    
+            else:
                 return action.squeeze().detach()
 
     def get_action(self, obs, is_deterministic = False):
@@ -149,7 +150,7 @@ class PpoPlayerDiscrete(BasePlayer):
         self.model.eval()
         input_dict = {
             'is_train': False,
-            'prev_actions': None, 
+            'prev_actions': None,
             'obs' : obs,
             'rnn_states' : self.states
         }
@@ -162,12 +163,12 @@ class PpoPlayerDiscrete(BasePlayer):
             if is_deterministic:
                 action = [torch.argmax(logit.detach(), axis=1).squeeze() for logit in logits]
                 return torch.stack(action,dim=-1)
-            else:    
+            else:
                 return action.squeeze().detach()
         else:
             if is_deterministic:
                 return torch.argmax(logits.detach(), axis=-1).squeeze()
-            else:    
+            else:
                 return action.squeeze().detach()
 
     def restore(self, fn):
@@ -188,7 +189,7 @@ class SACPlayer(BasePlayer):
     def __init__(self, params):
         BasePlayer.__init__(self, params)
         self.network = self.config['network']
-        self.actions_num = self.action_space.shape[0] 
+        self.actions_num = self.action_space.shape[0]
         self.action_range = [
             float(self.env_info['action_space'].low.min()),
             float(self.env_info['action_space'].high.max())
@@ -204,7 +205,7 @@ class SACPlayer(BasePlayer):
             'value_size': self.env_info.get('value_size', 1),
             'normalize_value': False,
             'normalize_input': self.normalize_input,
-        }  
+        }
         self.model = self.network.build(config)
         self.model.to(self.device)
         self.model.eval()

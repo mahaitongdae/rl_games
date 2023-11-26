@@ -196,6 +196,7 @@ class BasePlayer(object):
                 break
 
             obses = self.env_reset(self.env)
+            infos = {}
             batch_size = 1
             batch_size = self.get_batch_size(obses, batch_size)
 
@@ -214,9 +215,10 @@ class BasePlayer(object):
                     action = self.get_masked_action(
                         obses, masks, is_deterministic)
                 else:
-                    action = self.get_action(obses, is_deterministic)
+                    action = self.get_action(obses, is_deterministic, infos=infos)
 
-                obses, r, done, info = self.env_step(self.env, action)
+                obses, r, done, infos = self.env_step(self.env, action)
+                info = infos
                 cr += r
                 steps += 1
 
