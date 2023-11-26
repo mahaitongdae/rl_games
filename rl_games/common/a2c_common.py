@@ -18,10 +18,10 @@ import gym
 
 from datetime import datetime
 from tensorboardX import SummaryWriter
-import torch 
+import torch
 from torch import nn
 import torch.distributed as dist
- 
+
 from time import sleep
 
 from rl_games.common import common_losses
@@ -134,19 +134,22 @@ class A2CBase(BaseAlgorithm):
 
         self.ppo = config.get('ppo', True)
         self.max_epochs = self.config.get('max_epochs', 1e6)
-        self.max_frames = self.config.get('max_frames', 1e10)
+        self.max_frames = self.config.get('max_frames', 1e12)
 
         self.is_adaptive_lr = config['lr_schedule'] == 'adaptive'
         self.linear_lr = config['lr_schedule'] == 'linear'
+        self.exp_lr = config['lr_schedule'] == 'exponential'
         self.schedule_type = config.get('schedule_type', 'legacy')
         if self.is_adaptive_lr:
             self.kl_threshold = config['kl_threshold']
             self.scheduler = schedulers.AdaptiveScheduler(self.kl_threshold)
-        elif self.linear_lr:
-            self.scheduler = schedulers.LinearScheduler(float(config['learning_rate']), 
-                max_steps=self.max_epochs, 
+        elif self.linear_lr or self.exp_lr:
+            self.scheduler = schedulers.LinearScheduler(float(config['learning_rate']),
+                max_steps=self.max_epochs,
                 apply_to_entropy=config.get('schedule_entropy', False),
-                start_entropy_coef=config.get('entropy_coef'))
+                start_entropy_coef=config.get('entropy_coef'),
+                log_lr=self.exp_lr,
+            )
         else:
             self.scheduler = schedulers.IdentityScheduler()
 
@@ -171,7 +174,7 @@ class A2CBase(BaseAlgorithm):
                 self.obs_shape[k] = v.shape
         else:
             self.obs_shape = self.observation_space.shape
- 
+
         self.critic_coef = config['critic_coef']
         self.grad_norm = config['grad_norm']
         self.gamma = self.config['gamma']
@@ -184,6 +187,7 @@ class A2CBase(BaseAlgorithm):
         self.game_lengths = torch_ext.AverageMeter(1, self.games_to_track).to(self.ppo_device)
         self.obs = None
         self.step_rewards = torch_ext.AverageMeter(1, self.games_to_track * self.steps_to_track_per_game).to(self.ppo_device)
+        self.step_actual_costs = torch_ext.AverageMeter(1, self.games_to_track * self.steps_to_track_per_game).to(self.ppo_device)   # Track the actual cost before reward shaping
         self.games_num = self.config['minibatch_size'] // self.seq_len # it is used only for current rnn implementation
         self.batch_size = self.horizon_length * self.num_actors * self.num_agents
         self.batch_size_envs = self.horizon_length * self.num_actors
@@ -202,6 +206,7 @@ class A2CBase(BaseAlgorithm):
         self.update_time = 0
         self.mean_rewards = self.last_mean_rewards = -100500
         self.mean_step_rewards = self.last_mean_step_rewards = -100500
+        self.mean_actual_costs = self.last_mean_actual_costs = 100500
         self.play_time = 0
         self.epoch_num = 0
         self.curr_frames = 0
@@ -307,7 +312,7 @@ class A2CBase(BaseAlgorithm):
         self.writer.add_scalar('performance/step_time', step_time, frame)
         self.writer.add_scalar('losses/a_loss', torch_ext.mean_list(a_losses).item(), frame)
         self.writer.add_scalar('losses/c_loss', torch_ext.mean_list(c_losses).item(), frame)
-                
+
         self.writer.add_scalar('losses/entropy', torch_ext.mean_list(entropies).item(), frame)
         self.writer.add_scalar('info/last_lr', last_lr * lr_mul, frame)
         self.writer.add_scalar('info/lr_mul', lr_mul, frame)
@@ -334,7 +339,7 @@ class A2CBase(BaseAlgorithm):
 
         for param_group in self.optimizer.param_groups:
             param_group['lr'] = lr
-        
+
         #if self.has_central_value:
         #    self.central_value_net.update_lr(lr)
 
@@ -343,7 +348,7 @@ class A2CBase(BaseAlgorithm):
         self.model.eval()
         input_dict = {
             'is_train': False,
-            'prev_actions': None, 
+            'prev_actions': None,
             'obs' : processed_obs,
             'rnn_states' : self.rnn_states
         }
@@ -377,7 +382,7 @@ class A2CBase(BaseAlgorithm):
                 processed_obs = self._preproc_obs(obs['obs'])
                 input_dict = {
                     'is_train': False,
-                    'prev_actions': None, 
+                    'prev_actions': None,
                     'obs' : processed_obs,
                     'rnn_states' : self.rnn_states
                 }
@@ -405,6 +410,7 @@ class A2CBase(BaseAlgorithm):
         val_shape = (self.horizon_length, batch_size, self.value_size)
         current_rewards_shape = (batch_size, self.value_size)
         self.current_rewards = torch.zeros(current_rewards_shape, dtype=torch.float32, device=self.ppo_device)
+        self.current_actual_costs = torch.zeros(current_rewards_shape, dtype=torch.float32, device=self.ppo_device)
         self.current_lengths = torch.zeros(batch_size, dtype=torch.float32, device=self.ppo_device)
         self.dones = torch.ones((batch_size,), dtype=torch.uint8, device=self.ppo_device)
 
@@ -439,7 +445,7 @@ class A2CBase(BaseAlgorithm):
                 upd_obs[key] = self._obs_to_tensors_internal(value)
         else:
             upd_obs = self.cast_obs(obs)
-        if not obs_is_dict or 'obs' not in obs:    
+        if not obs_is_dict or 'obs' not in obs:
             upd_obs = {'obs' : upd_obs}
         return upd_obs
 
@@ -513,8 +519,10 @@ class A2CBase(BaseAlgorithm):
         self.game_rewards.clear()
         self.game_lengths.clear()
         self.step_rewards.clear()
+        self.step_actual_costs.clear()
         self.mean_rewards = self.last_mean_rewards = -100500
         self.mean_step_rewards = self.last_mean_step_rewards = -100500
+        self.mean_actual_costs = self.last_mean_actual_costs = 100500
         self.algo_observer.after_clear_stats()
 
     def update_epoch(self):
@@ -553,6 +561,7 @@ class A2CBase(BaseAlgorithm):
         # We save it to the checkpoint to prevent overriding the "best ever" checkpoint upon experiment restart
         state['last_mean_rewards'] = self.last_mean_rewards
         state['last_mean_step_rewards'] = self.last_mean_step_rewards
+        state['last_mean_actual_costs'] = self.last_mean_actual_costs
 
         if self.vec_env is not None:
             env_state = self.vec_env.get_env_state()
@@ -569,6 +578,7 @@ class A2CBase(BaseAlgorithm):
         self.frame = weights.get('frame', 0)
         self.last_mean_rewards = weights.get('last_mean_rewards', -100500)
         self.last_mean_step_rewards = weights.get('last_mean_step_rewards', -100500)
+        self.last_mean_actual_costs = weights.get('last_mean_actual_costs', 100500)
 
         env_state = weights.get('env_state', None)
 
@@ -636,7 +646,7 @@ class A2CBase(BaseAlgorithm):
             self.experience_buffer.update_data('dones', n, self.dones)
 
             for k in update_list:
-                self.experience_buffer.update_data(k, n, res_dict[k]) 
+                self.experience_buffer.update_data(k, n, res_dict[k])
             if self.has_central_value:
                 self.experience_buffer.update_data('states', n, self.obs['states'])
 
@@ -653,18 +663,22 @@ class A2CBase(BaseAlgorithm):
             self.experience_buffer.update_data('rewards', n, shaped_rewards)
 
             self.current_rewards += rewards
+            if 'actual_costs' in infos:
+                self.current_actual_costs += infos['actual_costs'].unsqueeze(-1)
             self.current_lengths += 1
             all_done_indices = self.dones.nonzero(as_tuple=False)
             env_done_indices = self.dones.view(self.num_actors, self.num_agents).all(dim=1).nonzero(as_tuple=False)
 
             self.game_rewards.update(self.current_rewards[env_done_indices])
             self.step_rewards.weighted_update(self.current_rewards[env_done_indices] / self.current_lengths[env_done_indices].unsqueeze(-1), self.current_lengths[env_done_indices].unsqueeze(-1))
+            self.step_actual_costs.weighted_update(self.current_actual_costs[env_done_indices] / self.current_lengths[env_done_indices].unsqueeze(-1), self.current_lengths[env_done_indices].unsqueeze(-1))
             self.game_lengths.update(self.current_lengths[env_done_indices])
             self.algo_observer.process_infos(infos, env_done_indices)
 
             not_dones = 1.0 - self.dones.bool().float()
 
             self.current_rewards = self.current_rewards * not_dones.unsqueeze(1)
+            self.current_actual_costs = self.current_actual_costs * not_dones.unsqueeze(1)
             self.current_lengths = self.current_lengths * not_dones
 
         last_values = self.get_values(self.obs)
@@ -726,6 +740,8 @@ class A2CBase(BaseAlgorithm):
                 self.experience_buffer.update_data('ground_truths', n, infos["ground_truths"])
 
             self.current_rewards += rewards
+            if 'actual_costs' in infos:
+                self.current_actual_costs += infos['actual_costs'].unsqueeze(-1)
             self.current_lengths += 1
             all_done_indices = self.dones.nonzero(as_tuple=False)
             env_done_indices = self.dones.view(self.num_actors, self.num_agents).all(dim=1).nonzero(as_tuple=False)
@@ -737,12 +753,14 @@ class A2CBase(BaseAlgorithm):
 
             self.game_rewards.update(self.current_rewards[env_done_indices])
             self.step_rewards.weighted_update(self.current_rewards[env_done_indices] / self.current_lengths[env_done_indices].unsqueeze(-1), self.current_lengths[env_done_indices].unsqueeze(-1))
+            self.step_actual_costs.weighted_update(self.current_actual_costs[env_done_indices] / self.current_lengths[env_done_indices].unsqueeze(-1), self.current_lengths[env_done_indices].unsqueeze(-1))
             self.game_lengths.update(self.current_lengths[env_done_indices])
             self.algo_observer.process_infos(infos, env_done_indices)
 
             not_dones = 1.0 - self.dones.float()
 
             self.current_rewards = self.current_rewards * not_dones.unsqueeze(1)
+            self.current_actual_costs = self.current_actual_costs * not_dones.unsqueeze(1)
             self.current_lengths = self.current_lengths * not_dones
 
         last_values = self.get_values(self.obs)
@@ -780,7 +798,7 @@ class DiscreteA2CBase(A2CBase):
             self.actions_num = action_space.n
             self.is_multi_discrete = False
         if type(action_space) is gym.spaces.Tuple:
-            self.actions_shape = (self.horizon_length, batch_size, len(action_space)) 
+            self.actions_shape = (self.horizon_length, batch_size, len(action_space))
             self.actions_num = [action.n for action in action_space]
             self.is_multi_discrete = True
         self.is_discrete = True
@@ -904,7 +922,7 @@ class DiscreteA2CBase(A2CBase):
             dataset_dict['returns'] = returns
             dataset_dict['actions'] = actions
             dataset_dict['dones'] = dones
-            dataset_dict['obs'] = batch_dict['states'] 
+            dataset_dict['obs'] = batch_dict['states']
             dataset_dict['rnn_masks'] = rnn_masks
             self.central_value_net.update_dataset(dataset_dict)
 
@@ -912,6 +930,7 @@ class DiscreteA2CBase(A2CBase):
         self.init_tensors()
         self.mean_rewards = self.last_mean_rewards = -100500
         self.mean_step_rewards = self.last_mean_step_rewards = -100500
+        self.mean_step_actual_costs = self.last_mean_step_actual_costs = 100500
         start_time = time.time()
         total_time = 0
         rep_count = 0
@@ -957,13 +976,16 @@ class DiscreteA2CBase(A2CBase):
                 if self.game_rewards.current_size > 0:
                     mean_rewards = self.game_rewards.get_mean()
                     mean_step_rewards = self.step_rewards.get_mean()
+                    mean_step_actual_costs = self.step_actual_costs.get_mean()
                     mean_lengths = self.game_lengths.get_mean()
                     self.mean_rewards = mean_rewards[0]
                     self.mean_step_rewards = mean_step_rewards[0]
+                    self.mean_step_actual_costs = mean_step_actual_costs[0]
 
                     for i in range(self.value_size):
                         rewards_name = 'rewards' if i == 0 else 'rewards{0}'.format(i)
                         costs_name = 'costs' if i == 0 else 'costs{0}'.format(i)
+                        actual_costs_name = 'actual_costs' if i == 0 else 'actual_costs{0}'.format(i)
                         self.writer.add_scalar('per_game_' + rewards_name + '/step'.format(i), mean_rewards[i], frame)
                         self.writer.add_scalar('per_game_' + rewards_name + '/iter'.format(i), mean_rewards[i], epoch_num)
                         self.writer.add_scalar('per_game_' + rewards_name + '/time'.format(i), mean_rewards[i], total_time)
@@ -973,6 +995,9 @@ class DiscreteA2CBase(A2CBase):
                         self.writer.add_scalar('per_step_' + costs_name + '/step'.format(i), -mean_step_rewards[i], frame)
                         self.writer.add_scalar('per_step_' + costs_name + '/iter'.format(i), -mean_step_rewards[i], epoch_num)
                         self.writer.add_scalar('per_step_' + costs_name + '/time'.format(i), -mean_step_rewards[i], total_time)
+                        self.writer.add_scalar('per_step_' + actual_costs_name + '/step'.format(i), mean_step_actual_costs[i], frame)
+                        self.writer.add_scalar('per_step_' + actual_costs_name + '/iter'.format(i), mean_step_actual_costs[i], epoch_num)
+                        self.writer.add_scalar('per_step_' + actual_costs_name + '/time'.format(i), mean_step_actual_costs[i], total_time)
 
                     self.writer.add_scalar('episode_lengths/step', mean_lengths, frame)
                     self.writer.add_scalar('episode_lengths/iter', mean_lengths, epoch_num)
@@ -1030,7 +1055,7 @@ class ContinuousA2CBase(A2CBase):
         # todo introduce device instead of cuda()
         self.actions_low = torch.from_numpy(action_space.low.copy()).float().to(self.ppo_device)
         self.actions_high = torch.from_numpy(action_space.high.copy()).float().to(self.ppo_device)
-   
+
     def preprocess_actions(self, actions):
         if self.clip_actions:
             clamped_actions = torch.clamp(actions, -1.0, 1.0)
@@ -1255,13 +1280,16 @@ class ContinuousA2CBase(A2CBase):
                 if self.game_rewards.current_size > 0:
                     mean_rewards = self.game_rewards.get_mean()
                     mean_step_rewards = self.step_rewards.get_mean()
+                    mean_step_actual_costs = self.step_actual_costs.get_mean()
                     mean_lengths = self.game_lengths.get_mean()
                     self.mean_rewards = mean_rewards[0]
                     self.mean_step_rewards = mean_step_rewards[0]
+                    self.mean_step_actual_costs = mean_step_actual_costs[0]
 
                     for i in range(self.value_size):
                         rewards_name = 'rewards' if i == 0 else 'rewards{0}'.format(i)
                         costs_name = 'costs' if i == 0 else 'costs{0}'.format(i)
+                        actual_costs_name = 'actual_costs' if i == 0 else 'actual_costs{0}'.format(i)
                         self.writer.add_scalar('per_game_' + rewards_name + '/step'.format(i), mean_rewards[i], frame)
                         self.writer.add_scalar('per_game_' + rewards_name + '/iter'.format(i), mean_rewards[i], epoch_num)
                         self.writer.add_scalar('per_game_' + rewards_name + '/time'.format(i), mean_rewards[i], total_time)
@@ -1271,6 +1299,9 @@ class ContinuousA2CBase(A2CBase):
                         self.writer.add_scalar('per_step_' + costs_name + '/step'.format(i), -mean_step_rewards[i], frame)
                         self.writer.add_scalar('per_step_' + costs_name + '/iter'.format(i), -mean_step_rewards[i], epoch_num)
                         self.writer.add_scalar('per_step_' + costs_name + '/time'.format(i), -mean_step_rewards[i], total_time)
+                        self.writer.add_scalar('per_step_' + actual_costs_name + '/step'.format(i), mean_step_actual_costs[i], frame)
+                        self.writer.add_scalar('per_step_' + actual_costs_name + '/iter'.format(i), mean_step_actual_costs[i], epoch_num)
+                        self.writer.add_scalar('per_step_' + actual_costs_name + '/time'.format(i), mean_step_actual_costs[i], total_time)
 
                     self.writer.add_scalar('episode_lengths/step', mean_lengths, frame)
                     self.writer.add_scalar('episode_lengths/iter', mean_lengths, epoch_num)
